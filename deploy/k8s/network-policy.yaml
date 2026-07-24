@@ -1,0 +1,26 @@
+# Only pods in this namespace (i.e. Model Builder) may reach the gateway.
+# This keeps the subscription-spending endpoint walled off from anything
+# else running in the cluster, which matters if this namespace shares a
+# cluster with product workloads.
+#
+# Notes:
+# - Enforcement requires a NetworkPolicy-capable CNI. k3s enforces out of
+#   the box; bare flannel does not (the policy is then silently inert).
+# - kubectl port-forward bypasses NetworkPolicy, which is exactly how admin
+#   UI access is meant to work (see docs/INSTALL-new-server.md).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-same-namespace-only
+spec:
+  podSelector:
+    matchLabels:
+      app: claude-subscription-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8790
+          protocol: TCP

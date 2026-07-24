@@ -1,13 +1,15 @@
 # TOIS — Kubernetes Installer
 
-Installs **Transpara Agentic Monitoring** (**TOIS**) to a Kubernetes cluster
-that already has **Model Builder** deployed. TOIS shares Model Builder's
-namespace and reuses its `claude-subscription-gateway`, so you only pay
-one Claude subscription and there is nothing new to log into.
+Installs **Transpara Agentic Monitoring** (**TOIS**) to a Kubernetes cluster.
+Order-independent with Model Builder — install either one first, second one
+reuses the shared `claude-subscription-gateway` automatically.
 
 At the end you will have:
 
 - **TOIS** running with its UI on `http://<server-ip>:30788`
+- A `claude-subscription-gateway` pod backed by a Claude Max/Pro
+  subscription (installed by this script if one wasn't already running
+  on the cluster; reused otherwise)
 - Agent runs writing findings back to your tGraph as run briefs + per-finding
   comments (authored by the Transpara user you supply during install)
 - A verified end-to-end wire check: the LLM gateway is reachable and the
@@ -19,9 +21,9 @@ Browser ──▶ TOIS UI (:30788 NodePort) ──▶ TOIS API (:8788 ClusterIP)
                      ┌──────────────────────────┼──────────────────────────┐
                      ▼                          ▼                          ▼
         transpara-mcp (transpara ns)    claude-subscription-       tGraph API
-        cross-namespace read layer       gateway (same ns)         (borgdev.transpara.io)
-                                         reuses Model Builder's    run briefs + annotations
-                                         subscription
+        cross-namespace read layer       gateway (any ns —         (borgdev.transpara.io
+                                          discovered at            by default; editable
+                                          install time)             in Settings)
 ```
 
 This repository contains the installer script and the deployment manifests
@@ -33,22 +35,16 @@ no registry credentials are needed either.
 
 ## Prerequisites
 
-**Model Builder must already be installed on the same cluster.** TOIS depends
-on the `model-builder` namespace, the `gateway-secrets` secret (specifically
-its `CSG_API_KEY`), and the running `claude-subscription-gateway` deployment
-that Model Builder provisions. If you don't have Model Builder yet, install
-it first:
-
-> https://github.com/transpara/model-builder-install
-
-**You will also need:**
-
+- A working Kubernetes cluster (`kubectl` reaches it). If you don't have
+  one, the model-builder installer includes a `--install-k3s` flag that
+  gets you a working single-node cluster in a couple of minutes:
+  https://github.com/transpara/model-builder-install
+- If Model Builder is already installed on this cluster, TOIS reuses its
+  gateway automatically. If not, TOIS installs one (and prompts you for a
+  one-time Claude subscription login).
 - Your **Transpara username + password** — the account TOIS uses to
   authenticate against tGraph when posting run briefs and per-finding
-  comments. Typically an `tai` service account created in your Transpara
-  platform's Keycloak.
-- **SSH access with sudo** on the target server (only needed if kubectl on
-  the box requires it, e.g. on a fresh k3s install).
+  comments. Typically the `tai` service account.
 
 ---
 
@@ -103,8 +99,11 @@ The script is idempotent: safe to re-run after fixing anything that failed.
 
 ## What lands on the cluster
 
-Everything goes into the `model-builder` namespace (shared with Model
-Builder itself):
+Everything goes into the `model-builder` namespace (the current shared
+home for both TOIS and Model Builder; eventual migration to `transpara`
+is a coordinated future step across all platform apps).
+
+**Always deployed** (idempotent — reapplied on every install run):
 
 | Object | Purpose |
 |---|---|
@@ -114,6 +113,17 @@ Builder itself):
 | `Service tois` (ClusterIP :8788) | in-cluster only |
 | `Deployment tois-ui` (1 replica) | nginx serving the SPA + proxying `/api/` |
 | `Service tois-ui` (NodePort :30788) | operator-facing entry point |
+
+**Deployed only if no `claude-subscription-gateway` exists anywhere on
+the cluster** — reused otherwise:
+
+| Object | Purpose |
+|---|---|
+| `Deployment claude-subscription-gateway` | Anthropic Messages API in front of the local `claude` CLI |
+| `Service claude-subscription-gateway` (ClusterIP :8790) | in-cluster only |
+| `PVC claude-credentials` (1 Gi) | Claude subscription login persistence |
+| `Secret gateway-secrets` | `CSG_API_KEY` (shared) + optional `CSG_CLAUDE_OAUTH_TOKEN` |
+| `NetworkPolicy gateway-same-namespace-only` | Firewalls the gateway to same-namespace pods |
 
 Runtime-tunable settings (gateway URL + API key, MCP URL, Transpara
 credentials, enricher, model) live in `/data/tois-settings.json` on

@@ -1,0 +1,148 @@
+# claude-subscription-gateway: serves the Anthropic Messages API on :8790,
+# fulfils requests by running the bundled claude CLI against a Claude Max
+# subscription login stored in the claude-credentials PVC.
+#
+# First-run login (one time, interactive):
+#   kubectl -n model-builder exec -it deploy/claude-subscription-gateway -- claude setup-token
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: claude-credentials
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-subscription-gateway
+  labels:
+    app: claude-subscription-gateway
+spec:
+  replicas: 1
+  # Single credential volume and a single CLI login: never run two at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: claude-subscription-gateway
+  template:
+    metadata:
+      labels:
+        app: claude-subscription-gateway
+    spec:
+      initContainers:
+        # Seed the credentials volume: the .claude.json subPath mount below
+        # must target an existing FILE (kubelet creates a directory for a
+        # missing subPath), and appuser (UID 1000) must be able to write so
+        # the CLI can store and refresh OAuth tokens.
+        - name: seed-credentials
+          # Through the Harbor docker.io proxy project so every image in this
+          # deployment resolves via registry.transpara.com.
+          image: registry.transpara.com/docker.io/library/busybox:1.36
+          command:
+            - sh
+            - -c
+            - >-
+              mkdir -p /creds/claude &&
+              { [ -s /creds/claude.json ] || echo '{}' > /creds/claude.json; } &&
+              chown -R 1000:1000 /creds
+          volumeMounts:
+            - name: claude-credentials
+              mountPath: /creds
+      containers:
+        - name: gateway
+          # Pulled anonymously from the Transpara registry (public project) —
+          # no imagePullSecrets needed. Harbor enforces tag immutability on
+          # this project, so tags are pinned (git SHA + digest, the Transpara
+          # convention) and updating means bumping this ref, never re-pushing.
+          image: registry.transpara.com/transpara/claude-subscription-gateway:fff4e2702a0e823a300e952c04ba9c68b7e80285@sha256:9da9fe9b69c30b52a596f327ee64d5e1b3ff88bd339caf12c869621380ae3859
+          # IfNotPresent pairs with the immutable pinned tag — Always would
+          # just re-check the registry for a ref that cannot change.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8790
+          env:
+            - name: CSG_HOST
+              value: "0.0.0.0"
+            - name: CSG_PORT
+              value: "8790"
+            # REQUIRED true for Model Builder: with tools off, the research
+            # step's WebSearch/WebFetch silently no-op and models come out
+            # generic. There is no error when this is wrong.
+            - name: CSG_ALLOW_TOOLS
+              value: "true"
+            - name: CSG_DEFAULT_MODEL
+              value: "opus"
+            - name: CSG_MAX_CONCURRENCY
+              value: "4"
+            # Long-lived subscription token from `claude setup-token` (the CLI
+            # prints it rather than storing it). The installer saves it into
+            # gateway-secrets; the gateway injects it into every claude call.
+            # Optional: the key does not exist until the first login.
+            - name: CSG_CLAUDE_OAUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: CSG_CLAUDE_OAUTH_TOKEN
+                  optional: true
+            - name: CSG_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: CSG_API_KEY
+            - name: CSG_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: CSG_ADMIN_PASSWORD
+          volumeMounts:
+            # subPath mounts on purpose: mounting the volume over all of
+            # /home/appuser would shadow ~/.local, where the image's uv
+            # runtime lives.
+            - name: claude-credentials
+              mountPath: /home/appuser/.claude
+              subPath: claude
+            - name: claude-credentials
+              mountPath: /home/appuser/.claude.json
+              subPath: claude.json
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8790
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8790
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          # Requests only, no limits: claude CLI subprocesses spike in memory
+          # during generation, and an OOM kill mid-run is worse than temporary
+          # node pressure on a prototype box.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+      volumes:
+        - name: claude-credentials
+          persistentVolumeClaim:
+            claimName: claude-credentials
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-subscription-gateway
+spec:
+  # ClusterIP only, never exposed outside the cluster: anything that can
+  # reach this port can spend the Claude subscription. Admin UI access is
+  # via kubectl port-forward.
+  selector:
+    app: claude-subscription-gateway
+  ports:
+    - port: 8790
+      targetPort: 8790
