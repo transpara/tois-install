@@ -1,0 +1,188 @@
+# TOIS API + scheduler pod.
+#
+# Single replica: SQLite on a PVC = single writer, never two pods at once.
+# Recreate strategy so a rolling update never briefly runs two pods
+# against the same volume.
+#
+# The pod reads TOIS's `tois.yaml` config from a ConfigMap (mounted at
+# /app/tois.yaml). Env vars set the URLs TOIS needs to reach in-cluster:
+# MCP in the `transpara` namespace, the gateway in this one. tGraph
+# writes still go to the public borgdev URL (TLS + Keycloak auth).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tois-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  # zfs (OpenEBS local-pv) is the production storage class on this cluster.
+  # local-path also works and is the k3s default; pin zfs so restarts land
+  # on the same volume without depending on default-class election.
+  storageClassName: zfs
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tois-config
+data:
+  tois.yaml: |
+    # TOIS runtime config, mounted at /app/tois.yaml in the container.
+    # The Settings API can persist edits back here when the ConfigMap
+    # is bound writable — for now this ships as read-only defaults; use
+    # env vars for anything that changes per-site.
+    scopes:
+      - entity_id: 4b11aadc-057f-5d68-a48d-04cd710d235d
+        entity_path: AvistaPower
+        label: Avista Power
+    agents:
+      stub:
+        enabled: false
+    business_weights: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tois
+  labels:
+    app: tois
+spec:
+  replicas: 1
+  # SQLite on the volume: single writer, never two pods at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tois
+  template:
+    metadata:
+      labels:
+        app: tois
+    spec:
+      # Fresh PVCs on OpenEBS are root-owned; fsGroup makes /data writable
+      # by appuser (UID 1000, matches the Dockerfile) so SQLite can create
+      # its files.
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: tois
+          # Public registry (anonymous pull). CI pushes on merge to main
+          # (see .github/workflows/build-image.yml): mutable `latest` +
+          # an immutable git-SHA tag for provenance. Match the digest
+          # via `kubectl describe pod` and the SHA tag in Harbor.
+          image: registry.transpara.com/transpara/tois:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8788
+          env:
+            - name: TOIS_DATABASE_URL
+              value: "sqlite:////data/tois.db"
+            - name: TOIS_CONFIG_FILE
+              value: "/app/tois.yaml"
+            - name: TOIS_LOG_LEVEL
+              value: "INFO"
+            - name: TOIS_AUTO_RESOLVE_AFTER_CLEAN_RUNS
+              value: "3"
+            - name: TOIS_NARRATIVE_MODEL
+              value: "claude-sonnet-4-6"
+            # `gateway` = claude-subscription-gateway HTTP transport. The
+            # gateway lives in this namespace; we reach it by bare svc name.
+            - name: TOIS_ENRICHER
+              value: "gateway"
+            - name: TOIS_GATEWAY_URL
+              value: "http://claude-subscription-gateway:8790/v1/messages"
+            # Model-builder's install script wrote CSG_API_KEY into
+            # gateway-secrets; TOIS reuses the SAME key so both apps hit
+            # the gateway with the same x-api-key.
+            - name: TOIS_GATEWAY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: CSG_API_KEY
+            # Transpara MCP: cross-namespace, read-only. Same MCP the
+            # detectors use today, just via in-cluster DNS instead of a
+            # tunnel.
+            - name: TOIS_MCP_URL
+              value: "http://transpara-mcp.transpara.svc.cluster.local/mcp"
+            # tGraph write path: public URL because the internal cert
+            # doesn't have a SAN for the ClusterIP name. TLS to
+            # borgdev.transpara.io works cleanly.
+            - name: TOIS_TRANSPARA_BASE_URL
+              value: "https://borgdev.transpara.io"
+            - name: TOIS_TRANSPARA_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: tois-secrets
+                  key: TRANSPARA_USERNAME
+            - name: TOIS_TRANSPARA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: tois-secrets
+                  key: TRANSPARA_PASSWORD
+            - name: TOIS_TGRAPH_REPLY_SEVERITIES
+              value: "critical,high"
+            # Scheduler off in the deployed PoC; all runs operator-triggered.
+            - name: TOIS_RUN_SCHEDULER
+              value: "false"
+            # No CORS needed: the nginx sidecar (tois-ui) proxies same-origin.
+            - name: TOIS_CORS_ALLOW_ORIGINS
+              value: ""
+          # Kyverno pod-security baseline: runAsNonRoot + seccomp default,
+          # no privileged, no host anything. TOIS doesn't need any of that.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: tois-data
+              mountPath: /data
+            - name: tois-config
+              mountPath: /app/tois.yaml
+              subPath: tois.yaml
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8788
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          # Generous liveness: an agent run can hold the event loop for
+          # tens of seconds. Don't restart mid-run over one slow probe.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8788
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+      volumes:
+        - name: tois-data
+          persistentVolumeClaim:
+            claimName: tois-data
+        - name: tois-config
+          configMap:
+            name: tois-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tois
+spec:
+  # ClusterIP: tois-ui reaches it in-cluster; no direct external access.
+  type: ClusterIP
+  selector:
+    app: tois
+  ports:
+    - port: 8788
+      targetPort: 8788
+      protocol: TCP

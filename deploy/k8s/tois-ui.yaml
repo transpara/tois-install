@@ -1,0 +1,70 @@
+# TOIS UI: nginx serving the built Vite SPA and reverse-proxying /api/
+# to the tois service. Same pattern as the docker-compose setup, just
+# in a Kubernetes Deployment.
+#
+# NodePort so the browser can reach it directly on the LAN via
+# http://<node-ip>:30788. Bump to Ingress + TLS once you have one.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tois-ui
+  labels:
+    app: tois-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tois-ui
+  template:
+    metadata:
+      labels:
+        app: tois-ui
+    spec:
+      containers:
+        - name: nginx
+          # Built from demo/inbox-app/Dockerfile.k8s (unprivileged nginx,
+          # listens on 8080). CI pushes on merge to main; anonymous pull.
+          image: registry.transpara.com/transpara/tois-ui:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          # Kyverno pod-security baseline.
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tois-ui
+spec:
+  # NodePort so the UI is reachable at http://<node-ip>:30788 without an
+  # ingress controller. Model-builder uses 30410; TOIS uses 30788 for
+  # symmetry with its default HTTP port 8788.
+  type: NodePort
+  selector:
+    app: tois-ui
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 30788

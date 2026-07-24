@@ -1,0 +1,25 @@
+# TOIS on k3s.
+#
+# Deploys the FastAPI service + the nginx-fronted SPA into the SHARED
+# `model-builder` namespace (same as model-builder + the existing
+# claude-subscription-gateway). One namespace, one Claude subscription,
+# one place to look for pods.
+#
+# Assumes the following already exist in the namespace:
+#   - claude-subscription-gateway  (Service + Deployment, model-builder's)
+#   - gateway-secrets              (Secret; TOIS reads CSG_API_KEY out of it)
+#
+# The Transpara platform (tGraph, transpara-mcp) lives in the `transpara`
+# namespace; TOIS reaches it via cross-namespace DNS.
+#
+# Deploy:
+#   kubectl apply -k deploy/k8s/
+#
+# See scripts/install-tois.sh for the full one-shot installer (creates
+# tois-secrets from prompts, waits for rollout, health-checks).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: model-builder
+resources:
+  - tois.yaml
+  - tois-ui.yaml

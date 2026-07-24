@@ -1,0 +1,3 @@
+# Local AI-tooling session state — never commit
+.omc/
+.claude/
