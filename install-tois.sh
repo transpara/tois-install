@@ -61,18 +61,19 @@ wait_for_rollout_with_progress() {
   local timeout="${2:-300s}"
   local selector="app=${deploy}"
   local start=$(date +%s)
+  # The whole function runs with errexit off — we kill our background
+  # ticker (SIGTERM) and `wait` for it, both of which return non-zero
+  # under normal termination and would blow up the outer `set -e`.
+  set +e
 
-  # Background ticker: print pod status + latest scheduling/pull event.
   (
     while true; do
       sleep 10
       local elapsed=$(( $(date +%s) - start ))
-      # Pod-level: phase + container state (Pulling / Running / …).
       local pod_state
       pod_state=$($KUBECTL -n "$NS" get pod -l "$selector" \
         -o 'jsonpath={range .items[*]}{.status.phase}{" "}{range .status.containerStatuses[*]}{.name}={.state}{" "}{end}{"\n"}{end}' 2>/dev/null \
         | tr -d '\n' | head -c 300)
-      # Last two events for this deployment's pods.
       local last_event
       last_event=$($KUBECTL -n "$NS" get events --sort-by=.lastTimestamp \
         --field-selector "involvedObject.kind=Pod" 2>/dev/null \
@@ -83,13 +84,12 @@ wait_for_rollout_with_progress() {
     done
   ) &
   local ticker=$!
-  # Kill the ticker on any exit (foreground finish, error, ctrl-C).
-  trap "kill $ticker 2>/dev/null; trap - RETURN" RETURN
 
   $KUBECTL -n "$NS" rollout status "deploy/$deploy" --timeout="$timeout"
   local rc=$?
-  kill "$ticker" 2>/dev/null || true
-  wait "$ticker" 2>/dev/null || true
+  kill "$ticker" 2>/dev/null
+  wait "$ticker" 2>/dev/null
+  set -e
   return "$rc"
 }
 
