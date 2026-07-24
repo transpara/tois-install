@@ -4,10 +4,18 @@
 # Recreate strategy so a rolling update never briefly runs two pods
 # against the same volume.
 #
-# The pod reads TOIS's `tois.yaml` config from a ConfigMap (mounted at
-# /app/tois.yaml). Env vars set the URLs TOIS needs to reach in-cluster:
-# MCP in the `transpara` namespace, the gateway in this one. tGraph
-# writes still go to the public borgdev URL (TLS + Keycloak auth).
+# Two configuration surfaces:
+# - `/app/tois.yaml` (ConfigMap): ops-time config — scopes, per-agent
+#   overrides, business weights. Fixed per deployment, edited by ops.
+# - `/data/tois-settings.json` (on the PVC): runtime-tunable settings —
+#   gateway URL + api key, Transpara creds, MCP URL, enricher choice,
+#   narrative model. Edited by operators through the Settings page;
+#   the install script seeds this file on first deploy.
+#
+# Env vars for the runtime-tunable fields (TOIS_TRANSPARA_*,
+# TOIS_GATEWAY_*, TOIS_ENRICHER, TOIS_NARRATIVE_MODEL, TOIS_MCP_URL)
+# used to live here — they moved into the store. Anything still setting
+# them via env is ignored.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -81,46 +89,14 @@ spec:
               value: "sqlite:////data/tois.db"
             - name: TOIS_CONFIG_FILE
               value: "/app/tois.yaml"
+            # Runtime-tunable settings file. Editable via the Settings
+            # page; the install script seeds it on first deploy.
+            - name: TOIS_SETTINGS_FILE
+              value: "/data/tois-settings.json"
             - name: TOIS_LOG_LEVEL
               value: "INFO"
             - name: TOIS_AUTO_RESOLVE_AFTER_CLEAN_RUNS
               value: "3"
-            - name: TOIS_NARRATIVE_MODEL
-              value: "claude-sonnet-4-6"
-            # `gateway` = claude-subscription-gateway HTTP transport. The
-            # gateway lives in this namespace; we reach it by bare svc name.
-            - name: TOIS_ENRICHER
-              value: "gateway"
-            - name: TOIS_GATEWAY_URL
-              value: "http://claude-subscription-gateway:8790/v1/messages"
-            # Model-builder's install script wrote CSG_API_KEY into
-            # gateway-secrets; TOIS reuses the SAME key so both apps hit
-            # the gateway with the same x-api-key.
-            - name: TOIS_GATEWAY_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: gateway-secrets
-                  key: CSG_API_KEY
-            # Transpara MCP: cross-namespace, read-only. Same MCP the
-            # detectors use today, just via in-cluster DNS instead of a
-            # tunnel.
-            - name: TOIS_MCP_URL
-              value: "http://transpara-mcp.transpara.svc.cluster.local/mcp"
-            # tGraph write path: public URL because the internal cert
-            # doesn't have a SAN for the ClusterIP name. TLS to
-            # borgdev.transpara.io works cleanly.
-            - name: TOIS_TRANSPARA_BASE_URL
-              value: "https://borgdev.transpara.io"
-            - name: TOIS_TRANSPARA_USERNAME
-              valueFrom:
-                secretKeyRef:
-                  name: tois-secrets
-                  key: TRANSPARA_USERNAME
-            - name: TOIS_TRANSPARA_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: tois-secrets
-                  key: TRANSPARA_PASSWORD
             - name: TOIS_TGRAPH_REPLY_SEVERITIES
               value: "critical,high"
             # Scheduler off in the deployed PoC; all runs operator-triggered.

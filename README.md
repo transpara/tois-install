@@ -82,12 +82,14 @@ the standalone script fetches the manifests itself.
    prerequisites are present (the `model-builder` namespace, the
    `gateway-secrets` secret, the `claude-subscription-gateway` deployment).
    Fails fast with a clear pointer if any are missing.
-2. It prompts you once for a Transpara username + password and stores them
-   as `tois-secrets`. Existing secrets are never overwritten on a re-run —
-   pass `--rotate-secrets` if you want to change them.
-3. It deploys TOIS and the UI and waits for both pods to become Ready.
-4. It runs health checks on both pods, then runs **end-to-end wire probes**
-   via TOIS's own admin API:
+2. It deploys TOIS and the UI and waits for both pods to become Ready.
+3. It seeds runtime settings by PUT-ing them to `/api/admin/settings`
+   inside the pod: the k8s-canonical URLs (gateway, MCP, tGraph base)
+   are hard-coded, and it prompts you once for a Transpara username +
+   password. The store's `/data/tois-settings.json` on the PVC ends
+   up owning all of that. Existing passwords are never overwritten on
+   a re-run — pass `--rotate-transpara-password` to force.
+4. It runs **end-to-end wire probes** via TOIS's own admin API:
    - `test-gateway` — sends a tiny prompt through the whole chain
      (TOIS → gateway → claude CLI → subscription) and reports the round-trip.
    - `test-transpara` — logs into tGraph with the credentials you supplied
@@ -107,12 +109,16 @@ Builder itself):
 | Object | Purpose |
 |---|---|
 | `Deployment tois` (1 replica, Recreate) | FastAPI + agent runner |
-| `PVC tois-data` (2 Gi, zfs SC) | SQLite for findings + history |
-| `ConfigMap tois-config` | `tois.yaml` runtime config |
-| `Secret tois-secrets` | Transpara username + password |
+| `PVC tois-data` (2 Gi, zfs SC) | SQLite + `tois-settings.json` |
+| `ConfigMap tois-config` | Ops config — scopes, per-agent overrides, business weights |
 | `Service tois` (ClusterIP :8788) | in-cluster only |
 | `Deployment tois-ui` (1 replica) | nginx serving the SPA + proxying `/api/` |
 | `Service tois-ui` (NodePort :30788) | operator-facing entry point |
+
+Runtime-tunable settings (gateway URL + API key, MCP URL, Transpara
+credentials, enricher, model) live in `/data/tois-settings.json` on
+the PVC — the installer seeds it, the Settings page edits it. No
+Kubernetes Secret and no env vars for those.
 
 TOIS reads MCP cross-namespace at
 `http://transpara-mcp.transpara.svc.cluster.local/mcp` (unchanged from
@@ -141,15 +147,20 @@ To roll back to an earlier immutable tag, edit `deploy/k8s/tois.yaml`
 
 ## Rotate the Transpara password
 
-If the tGraph service account's password changes:
+Two ways:
+
+**From the Settings page:** open the UI, Settings → Transpara →
+Password → "Set new value…" → paste → Save. Takes effect immediately;
+no pod restart.
+
+**From the installer script:** if you've lost UI access,
 
 ```bash
-./install-tois.sh --rotate-secrets
-kubectl -n model-builder rollout restart deploy/tois
+./install-tois.sh --rotate-transpara-password
 ```
 
-The script re-prompts, writes the new `tois-secrets`, and the pod picks
-them up on restart.
+Re-prompts and PUTs the new password to `/api/admin/settings`. No pod
+restart needed either.
 
 ---
 
@@ -196,17 +207,15 @@ hand:
 kubectl -n model-builder get secret gateway-secrets
 kubectl -n model-builder get deploy claude-subscription-gateway
 
-# 2. Create Transpara credentials secret
-kubectl -n model-builder create secret generic tois-secrets \
-  --from-literal=TRANSPARA_USERNAME=tai \
-  --from-literal=TRANSPARA_PASSWORD='...'
-
-# 3. Apply manifests
+# 2. Apply manifests
 kubectl apply -k deploy/k8s/
 
-# 4. Watch
+# 3. Watch
 kubectl -n model-builder rollout status deploy/tois
 kubectl -n model-builder rollout status deploy/tois-ui
+
+# 4. Open the Settings page (http://<any-node-ip>:30788) and fill in
+#    Transpara URL + username + password, gateway URL, MCP URL. Save.
 ```
 
 UI at `http://<any-node-ip>:30788`.
