@@ -183,55 +183,74 @@ say "Waiting for TOIS rollouts (first image pulls can take a few minutes)"
 wait_for_rollout_with_progress tois    600s
 wait_for_rollout_with_progress tois-ui 300s
 
-# ── Claude subscription login (only when we installed the gateway) ───────
-if [ "$FRESH_GATEWAY" = true ] && [ "$SKIP_LOGIN" != true ]; then
-  say "Claude subscription login"
-  # Probe whether the gateway already has a working login (e.g. an
-  # older install left the secret behind).
-  PROBE=$($KUBECTL -n "$NS" exec deploy/claude-subscription-gateway -- \
-    curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+# ── Claude subscription login ────────────────────────────────────────────
+#
+# Probe on EVERY run, not just fresh installs. A gateway can exist but
+# not be logged in — e.g. a previous install created it and died before
+# reaching setup-token, or the token was revoked. In those cases the
+# rerun must offer to log in, otherwise wire probes silently fail.
+#
+# Same pattern as model-builder-install's probe_login().
+say "Checking Claude subscription login"
+probe_login() {
+  $KUBECTL -n "$NS" exec deploy/claude-subscription-gateway -- \
+    curl -s -o /dev/null -w '%{http_code}' --max-time 120 \
     -X POST http://localhost:8790/v1/messages \
     -H "x-api-key: $CSG_API_KEY" -H 'content-type: application/json' \
-    -d '{"model":"sonnet","max_tokens":8,"messages":[{"role":"user","content":"ok"}]}' \
-    2>/dev/null || echo 000)
-  if [ "$PROBE" = "200" ]; then
-    echo "Subscription login present; probe returned 200"
-  elif [ ! -t 0 ]; then
-    warn "no interactive terminal; skipping Claude subscription login (probe: $PROBE). Run `kubectl -n $NS exec -it deploy/claude-subscription-gateway -- claude setup-token` later."
-  else
-    echo "The gateway has no working Claude login yet (probe returned $PROBE)."
-    read -rp "Run 'claude setup-token' in the gateway pod now? [y/N] " yn
-    if [ "${yn,,}" = "y" ]; then
-      $KUBECTL -n "$NS" exec -it deploy/claude-subscription-gateway -- claude setup-token || true
-      echo
-      echo "The CLI printed a long-lived token (sk-ant-oat01-...) but does NOT store it."
-      echo "Paste it below; it will be saved into gateway-secrets so the gateway"
-      echo "injects it on every claude call (survives restarts and updates)."
-      while true; do
-        read -rsp "Token (hidden; Enter to skip): " OAUTH_TOKEN; echo
-        [ -z "$OAUTH_TOKEN" ] && break
-        OAUTH_TOKEN="$(printf %s "$OAUTH_TOKEN" | tr -d '[:space:]')"
-        case "$OAUTH_TOKEN" in
-          sk-ant-oat01-*)
-            if [ "${#OAUTH_TOKEN}" -ge 80 ]; then break; fi
-            echo "That looks truncated (${#OAUTH_TOKEN} chars, expected ~108). Retry."
-            ;;
-          *)
-            echo "That does not look like a setup-token value (should start with sk-ant-oat01-). Try again."
-            ;;
-        esac
-      done
-      if [ -n "$OAUTH_TOKEN" ]; then
-        $KUBECTL -n "$NS" patch secret gateway-secrets --type merge \
-          -p "{\"stringData\":{\"CSG_CLAUDE_OAUTH_TOKEN\":\"$OAUTH_TOKEN\"}}"
-        $KUBECTL -n "$NS" set env deploy/claude-subscription-gateway \
-          --from=secret/gateway-secrets --keys=CSG_CLAUDE_OAUTH_TOKEN >/dev/null || true
-        $KUBECTL -n "$NS" rollout restart deploy/claude-subscription-gateway
-        $KUBECTL -n "$NS" rollout status deploy/claude-subscription-gateway --timeout=180s
-      fi
-    else
-      warn "skipped Claude login; the gateway probe will fail until you run 'claude setup-token' in the pod"
+    -d '{"model":"sonnet","max_tokens":8,"messages":[{"role":"user","content":"Reply with exactly: ok"}]}' \
+    2>/dev/null || echo 000
+}
+CODE=$(probe_login)
+if [ "$CODE" = "200" ]; then
+  echo "Subscription login present and working (probe: 200)"
+elif [ "$SKIP_LOGIN" = true ] || [ ! -t 0 ]; then
+  warn "gateway not logged in (probe returned $CODE); skipping interactive login. Run 'kubectl -n $NS exec -it deploy/claude-subscription-gateway -- claude setup-token' when you have a TTY."
+else
+  echo "The gateway has no working Claude login yet (probe returned $CODE)."
+  read -rp "Run 'claude setup-token' in the gateway pod now? [y/N] " yn
+  if [ "${yn,,}" = "y" ]; then
+    $KUBECTL -n "$NS" exec -it deploy/claude-subscription-gateway -- claude setup-token || true
+    echo
+    echo "The CLI printed a long-lived token (sk-ant-oat01-...) but does NOT store it."
+    echo "Paste it below; it is saved into the gateway-secrets secret, which the"
+    echo "gateway injects into every claude call (survives restarts and updates)."
+    # The token is ~108 chars and often wraps across two terminal lines
+    # when printed; a scrollback copy can carry a line break and silently
+    # truncate at the hidden prompt (seen live: half-token -> 401 every call).
+    while true; do
+      read -rsp "Token (hidden; Enter to skip): " OAUTH_TOKEN; echo
+      [ -z "$OAUTH_TOKEN" ] && break
+      OAUTH_TOKEN="$(printf %s "$OAUTH_TOKEN" | tr -d '[:space:]')"
+      case "$OAUTH_TOKEN" in
+        sk-ant-oat01-*)
+          if [ "${#OAUTH_TOKEN}" -ge 80 ]; then break; fi
+          echo "That looks truncated (${#OAUTH_TOKEN} chars, expected ~108). If the token"
+          echo "wrapped across two lines on screen, the clipboard split it: paste it into"
+          echo "a text editor, join to one line, copy again, then retry."
+          ;;
+        *)
+          echo "That does not look like a setup-token value (should start with sk-ant-oat01-). Try again."
+          ;;
+      esac
+    done
+    if [ -n "$OAUTH_TOKEN" ]; then
+      $KUBECTL -n "$NS" patch secret gateway-secrets --type merge \
+        -p "{\"stringData\":{\"CSG_CLAUDE_OAUTH_TOKEN\":\"$OAUTH_TOKEN\"}}"
+      # Belt and suspenders: ensure the deployment reads the secret even
+      # if the applied manifest predates the token wiring.
+      $KUBECTL -n "$NS" set env deploy/claude-subscription-gateway \
+        --from=secret/gateway-secrets --keys=CSG_CLAUDE_OAUTH_TOKEN >/dev/null || true
+      $KUBECTL -n "$NS" rollout restart deploy/claude-subscription-gateway
+      $KUBECTL -n "$NS" rollout status deploy/claude-subscription-gateway --timeout=180s
     fi
+    CODE=$(probe_login)
+    if [ "$CODE" = "200" ]; then
+      echo "Login verified end to end"
+    else
+      warn "probe still returns $CODE after login attempt; check gateway logs"
+    fi
+  else
+    warn "skipped Claude login; the wire probe below will fail until you run 'claude setup-token' in the pod"
   fi
 fi
 
