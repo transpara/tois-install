@@ -28,9 +28,13 @@ spec:
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
-          # Kyverno pod-security baseline.
+          # Kyverno pod-security baseline. runAsUser is set to nginx's
+          # numeric UID in the nginxinc/nginx-unprivileged image (101);
+          # kubelet requires the number to verify non-root, `USER nginx`
+          # by name isn't sufficient.
           securityContext:
             runAsNonRoot: true
+            runAsUser: 101
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
