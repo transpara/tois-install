@@ -53,6 +53,46 @@ say()  { echo; echo "==> $*"; }
 warn() { echo "WARNING: $*" >&2; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
 
+# Wrap `kubectl rollout status` with a background ticker that prints
+# pod state + the latest event every 10s. Without this, image pulls
+# look like a hang for 30-90s at a time. Args: <deploy-name> [timeout].
+wait_for_rollout_with_progress() {
+  local deploy="$1"
+  local timeout="${2:-300s}"
+  local selector="app=${deploy}"
+  local start=$(date +%s)
+
+  # Background ticker: print pod status + latest scheduling/pull event.
+  (
+    while true; do
+      sleep 10
+      local elapsed=$(( $(date +%s) - start ))
+      # Pod-level: phase + container state (Pulling / Running / …).
+      local pod_state
+      pod_state=$($KUBECTL -n "$NS" get pod -l "$selector" \
+        -o 'jsonpath={range .items[*]}{.status.phase}{" "}{range .status.containerStatuses[*]}{.name}={.state}{" "}{end}{"\n"}{end}' 2>/dev/null \
+        | tr -d '\n' | head -c 300)
+      # Last two events for this deployment's pods.
+      local last_event
+      last_event=$($KUBECTL -n "$NS" get events --sort-by=.lastTimestamp \
+        --field-selector "involvedObject.kind=Pod" 2>/dev/null \
+        | grep -E "${deploy}-|Pulling|Pulled|Created|Started" \
+        | tail -1 | awk '{$1=""; print}' | head -c 220)
+      printf "  [%3ds] %s\n" "$elapsed" "${pod_state:-…}"
+      [ -n "$last_event" ] && printf "         %s\n" "$last_event"
+    done
+  ) &
+  local ticker=$!
+  # Kill the ticker on any exit (foreground finish, error, ctrl-C).
+  trap "kill $ticker 2>/dev/null; trap - RETURN" RETURN
+
+  $KUBECTL -n "$NS" rollout status "deploy/$deploy" --timeout="$timeout"
+  local rc=$?
+  kill "$ticker" 2>/dev/null || true
+  wait "$ticker" 2>/dev/null || true
+  return "$rc"
+}
+
 # Manifests: prefer a deploy/k8s next to (or one level above) the script;
 # otherwise fetch the public install repo tarball. No credentials needed.
 REPO_ROOT=""
@@ -136,12 +176,12 @@ $KUBECTL apply -k "$REPO_ROOT/deploy/k8s/"
 
 if [ "$FRESH_GATEWAY" = true ]; then
   say "Waiting for gateway rollout (first image pull can take a few minutes)"
-  $KUBECTL -n "$NS" rollout status deploy/claude-subscription-gateway --timeout=300s
+  wait_for_rollout_with_progress claude-subscription-gateway 600s
 fi
 
 say "Waiting for TOIS rollouts (first image pulls can take a few minutes)"
-$KUBECTL -n "$NS" rollout status deploy/tois --timeout=300s
-$KUBECTL -n "$NS" rollout status deploy/tois-ui --timeout=180s
+wait_for_rollout_with_progress tois    600s
+wait_for_rollout_with_progress tois-ui 300s
 
 # ── Claude subscription login (only when we installed the gateway) ───────
 if [ "$FRESH_GATEWAY" = true ] && [ "$SKIP_LOGIN" != true ]; then
