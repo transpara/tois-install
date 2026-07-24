@@ -26,10 +26,9 @@ spec:
   resources:
     requests:
       storage: 2Gi
-  # zfs (OpenEBS local-pv) is the production storage class on this cluster.
-  # local-path also works and is the k3s default; pin zfs so restarts land
-  # on the same volume without depending on default-class election.
-  storageClassName: zfs
+  # No storageClassName: uses whatever the cluster marks default (zfs on
+  # 141, lvm on 241, local-path on vanilla k3s). storageClassName is
+  # immutable after bind, so an already-provisioned PVC keeps its class.
 ---
 apiVersion: v1
 kind: ConfigMap
