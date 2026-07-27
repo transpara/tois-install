@@ -172,6 +172,21 @@ fi
 # is a no-op on the identical objects. When we're installing fresh,
 # it creates them.
 say "Applying manifests"
+
+# Boxes installed before 2026-07-23 applied the tois-data PVC with a
+# hardcoded storageClassName. Today's manifest omits the field, so a
+# re-apply computes a patch that REMOVES it — an immutable-field error
+# that kills the whole apply. Dropping the stale last-applied annotation
+# makes apply leave the field alone (metadata-only; a bound PVC's
+# storage class can never change anyway).
+if $KUBECTL -n "$NS" get pvc tois-data >/dev/null 2>&1 \
+   && $KUBECTL -n "$NS" get pvc tois-data \
+        -o jsonpath='{.metadata.annotations.kubectl\.kubernetes\.io/last-applied-configuration}' \
+        2>/dev/null | grep -q storageClassName; then
+  echo "Existing tois-data PVC pins storageClassName; clearing stale last-applied annotation"
+  $KUBECTL -n "$NS" annotate pvc tois-data kubectl.kubernetes.io/last-applied-configuration- >/dev/null
+fi
+
 $KUBECTL apply -k "$REPO_ROOT/deploy/k8s/"
 
 if [ "$FRESH_GATEWAY" = true ]; then
@@ -282,18 +297,34 @@ else
   fi
 fi
 
+# Transpara base URL: derive it from THIS box's stack instead of
+# hardcoding borgdev — tView deep links and tGraph comments must target
+# the local Transpara, not another site's. The transpara-mcp config's
+# TAUTH_URL is the local stack's public URL plus /tauth; strip the
+# suffix. Fall back to a prompt (interactive) or borgdev (headless).
+TP_BASE_URL=$($KUBECTL -n transpara get cm transpara-mcp-config \
+  -o jsonpath='{.data.TAUTH_URL}' 2>/dev/null | sed 's|/tauth/*$||')
+if [ -z "$TP_BASE_URL" ]; then
+  if [ -t 0 ]; then
+    read -rp "Transpara base URL [https://borgdev.transpara.io]: " TP_BASE_URL
+  fi
+  TP_BASE_URL="${TP_BASE_URL:-https://borgdev.transpara.io}"
+fi
+echo "Transpara base URL: $TP_BASE_URL"
+
 # Build the seed payload. Gateway URL points at the discovered
-# service DNS (which may be cross-namespace); Transpara base URL
-# defaults to borgdev but is editable via Settings later.
-PAYLOAD=$(TP_USER="$TP_USER" TP_PASS="$TP_PASS" CSG_API_KEY="$CSG_API_KEY" GATEWAY_URL="$GATEWAY_URL_IN_CLUSTER" python3 <<'PY'
+# service DNS (which may be cross-namespace). narrative_model uses the
+# gateway's CLI-shorthand model ids (sonnet/opus/haiku) — full
+# claude-* ids are stale the moment the CLI rotates versions.
+PAYLOAD=$(TP_USER="$TP_USER" TP_PASS="$TP_PASS" CSG_API_KEY="$CSG_API_KEY" GATEWAY_URL="$GATEWAY_URL_IN_CLUSTER" TP_BASE_URL="$TP_BASE_URL" python3 <<'PY'
 import json, os
 p = {
-    "transpara_base_url": "https://borgdev.transpara.io",
+    "transpara_base_url": os.environ["TP_BASE_URL"],
     "gateway_url": os.environ["GATEWAY_URL"],
     "gateway_api_key": os.environ["CSG_API_KEY"],
     "mcp_url": "http://transpara-mcp.transpara.svc.cluster.local/mcp",
     "enricher": "gateway",
-    "narrative_model": "claude-sonnet-4-6",
+    "narrative_model": "sonnet",
 }
 if os.environ.get("TP_PASS"):
     p["transpara_username"] = os.environ["TP_USER"]
