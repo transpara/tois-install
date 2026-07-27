@@ -59,7 +59,7 @@ spec:
           # no imagePullSecrets needed. Harbor enforces tag immutability on
           # this project, so tags are pinned (git SHA + digest, the Transpara
           # convention) and updating means bumping this ref, never re-pushing.
-          image: registry.transpara.com/transpara/claude-subscription-gateway:fff4e2702a0e823a300e952c04ba9c68b7e80285@sha256:9da9fe9b69c30b52a596f327ee64d5e1b3ff88bd339caf12c869621380ae3859
+          image: registry.transpara.com/transpara/claude-subscription-gateway:224fc9bb305ca94815c4f050a532aa8ae05d1b91@sha256:2df557fdaebbcfbc3a97168260f04e6e9a33b9625f63d945f7340897d5fd073e
           # IfNotPresent pairs with the immutable pinned tag — Always would
           # just re-check the registry for a ref that cannot change.
           imagePullPolicy: IfNotPresent
@@ -79,6 +79,16 @@ spec:
               value: "opus"
             - name: CSG_MAX_CONCURRENCY
               value: "4"
+            # Prompt agents call POST /v1/agent, which attaches the MCP server
+            # named in the request ("transpara"). Without this registry the
+            # gateway rejects every agent call with "unknown mcp_server". The
+            # URL matches the mcp_url the installer seeds into TOIS settings.
+            - name: CSG_MCP_SERVERS
+              value: '{"transpara": {"type": "http", "url": "http://transpara-mcp.transpara.svc.cluster.local/mcp"}}'
+            # Cap concurrent /v1/agent CLI runs; a third concurrent agent call
+            # gets a retryable 503 (TOIS retries these).
+            - name: CSG_AGENT_MAX_CONCURRENCY
+              value: "2"
             # Long-lived subscription token from `claude setup-token` (the CLI
             # prints it rather than storing it). The installer saves it into
             # gateway-secrets; the gateway injects it into every claude call.
