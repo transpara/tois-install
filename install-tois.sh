@@ -41,10 +41,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ROTATE_PW=false
 SKIP_LOGIN=false
+ROTATE_TOKEN=false
 for arg in "$@"; do
   case "$arg" in
     --rotate-transpara-password) ROTATE_PW=true ;;
     --skip-claude-login)         SKIP_LOGIN=true ;;
+    # Explicit opt-in to replace a STORED Claude token. Without this
+    # flag a failing login probe never touches an existing token.
+    --rotate-claude-token)       ROTATE_TOKEN=true ;;
     *) echo "Unknown flag: $arg" >&2; exit 1 ;;
   esac
 done
@@ -215,9 +219,34 @@ probe_login() {
     -d '{"model":"sonnet","max_tokens":8,"messages":[{"role":"user","content":"Reply with exactly: ok"}]}' \
     2>/dev/null || echo 000
 }
+
+# The apply above may have rolled the gateway pod (image/env change). A
+# probe against a mid-restart pod reads as "no login" and scares the
+# operator into re-pasting a token that is perfectly fine — settle the
+# rollout first, and retry the probe before concluding anything.
+$KUBECTL -n "$NS" rollout status deploy/claude-subscription-gateway --timeout=300s >/dev/null 2>&1 || true
 CODE=$(probe_login)
+for _ in 1 2; do
+  [ "$CODE" = "200" ] && break
+  sleep 5
+  CODE=$(probe_login)
+done
+
+# THE STORED TOKEN IS PRECIOUS: it can only be re-minted by an
+# interactive browser login. A failing probe with a token present is
+# almost always transient (pod restarting, upstream hiccup) — never
+# offer to replace the token in that case unless the operator
+# explicitly asked with --rotate-claude-token.
+TOKEN_STORED=$($KUBECTL -n "$NS" get secret gateway-secrets \
+  -o jsonpath='{.data.CSG_CLAUDE_OAUTH_TOKEN}' 2>/dev/null || true)
+
 if [ "$CODE" = "200" ]; then
   echo "Subscription login present and working (probe: 200)"
+elif [ -n "$TOKEN_STORED" ] && [ "$ROTATE_TOKEN" != true ]; then
+  warn "login probe returned $CODE, but a Claude token IS stored in gateway-secrets."
+  warn "Leaving it untouched — this is usually transient (gateway mid-restart)."
+  warn "Re-check in a minute with the TOIS Settings gateway test. If the token was"
+  warn "actually revoked/expired, re-run this installer with --rotate-claude-token."
 elif [ "$SKIP_LOGIN" = true ] || [ ! -t 0 ]; then
   warn "gateway not logged in (probe returned $CODE); skipping interactive login. Run 'kubectl -n $NS exec -it deploy/claude-subscription-gateway -- claude setup-token' when you have a TTY."
 else
