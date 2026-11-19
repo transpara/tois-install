@@ -18,7 +18,7 @@
 # that file on first deploy.
 #
 # Self-contained: run it next to a deploy/k8s directory (a clone of
-# transpara/tois-install or transpara/operational-intelligence-service)
+# transpara/tois-install or transpara/agentic-monitoring)
 # and it uses those manifests; run it standalone and it fetches them
 # from the public transpara/tois-install repo.
 #
